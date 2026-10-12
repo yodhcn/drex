@@ -140,9 +140,15 @@ RUN set -eux; \
 # 装进系统 Python（没有 venv，见上面 ENV 处的说明）。顺带一个好处：Triton 编译自己那个
 # C 扩展时用 sysconfig.get_paths()["include"] 找 Python.h，系统 Python 下就是标准的
 # /usr/include/python3.12（由 python3-dev 提供），不用去猜 venv 里的 include 目录。
+#
+# **刻意不升级 pip**：pip 由 apt 的 python3-pip 提供（Ubuntu 24.04 → pip 24.0），它的文件
+# 由 dpkg 拥有、没有 dist-info/RECORD，所以 `pip install --upgrade pip` 必然在卸载那一步
+# 失败（实测）：
+#     ERROR: Cannot uninstall pip 24.0, RECORD file not found. Hint: The package was installed by debian.
+# 绕开它只能加 --ignore-installed，那会让新版落到 /usr/local 与 dpkg 那份并存 —— 镜像里留
+# 两份 pip，只为换一个我们并没有用到的更新特性，不划算。直接用系统自带的那份。
 RUN set -eux; \
     ln -sf /usr/bin/python3 /usr/local/bin/python; \
-    python -m pip install --upgrade pip; \
     if [ -n "${FLASH_LINEAR_ATTENTION_SPEC}" ]; then \
         python -m pip install -r /opt/drex/requirements.txt "${FLASH_LINEAR_ATTENTION_SPEC}"; \
     else \

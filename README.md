@@ -271,13 +271,21 @@ FLA 也把 3.11 列为推荐版本（低于它只 warning，不影响正确性�
 容器本身就是隔离边界，再套一层 venv 只是多一个目录、多一层 `PATH` 重写，对「这个镜像里装了什么」
 没有任何帮助。所以依赖直接装进系统 Python，`python` / `python3` 是同一个解释器。
 
-两个随之而来的细节：
+三个随之而来的细节：
 
 - **镜像里补了 `/usr/local/bin/python` 软链**。Ubuntu 默认不提供 `python` 这个命令（只有 `python3`），
   而上游文档和自己的 README 都写 `python serve.py`，所以把它接上，省的每次都要改写命令。
 - **`PIP_BREAK_SYSTEM_PACKAGES=1`**。Ubuntu 24.04 带 PEP 668 的 `EXTERNALLY-MANAGED` 标记来保护
   系统包管理器，不越过它 pip 会直接拒绝安装。这里选择用这个变量显式越过，而**不删那个标记文件** ——
   万一有人真的误装到系统 Python，标记还在，行为依旧可见。
+- **不升级 pip**。pip 由 apt 的 `python3-pip` 提供（24.04 → pip 24.0），它的文件由 dpkg 拥有、
+  **没有 `dist-info/RECORD`**，所以 `pip install --upgrade pip` 必然失败在卸载那一步：
+  `ERROR: Cannot uninstall pip 24.0, RECORD file not found.`（这是去 venv 之后引入的，
+  venv 里的 pip 由 `ensurepip` 装、带 RECORD，所以以前能升）。
+  绕开它只能加 `--ignore-installed`，那会让新版落到 `/usr/local` 与 dpkg 那份并存 —— 为一份
+  用不到的更新特性在镜像里留两份 pip，不值得。**24.0 完全够用**：它 vendored 的是 `packaging 21.3`，
+  连 `packaging.metadata` 模块都没有，**根本不校验 Core Metadata 版本**，实测能装
+  `Metadata-Version: 2.5` 的 wheel（`fsspec 2026.9.0` 用的就是 2.5）和 `2.4` 的（`huggingface_hub 2.2.0`）。
 
 顺带一个好处：Triton 编译自己那个 C 扩展时用 `sysconfig.get_paths()["include"]` 找 `Python.h`，
 系统 Python 下就是标准的 `/usr/include/python3.12`（由 `python3-dev` 提供），不用去猜 venv 里的目录。
@@ -549,6 +557,9 @@ docker run --rm --gpus all -p 8000:8000 \
   真看到这句说明构建时把 `INSTALL_CAUSAL_CONV1D` 关掉了。（正常构建出来的镜像不会出现：
   构建期有一条 import 断言在挡「没装上但静默降级」这件事。）
 - 启动时 `nvidia_entrypoint.sh` 那段 CUDA banner 不再出现，是 `ENTRYPOINT []` 生效了。
+- **构建期** `WARNING: Running pip as the 'root' user can result in broken permissions ...` ——
+  去掉 venv 之后必然出现（容器里就是 root 在装系统 Python）。只是提示、不影响结果；
+  想去掉噪音可以在 `ENV` 里加一行 `PIP_ROOT_USER_ACTION=ignore`。
 
 ---
 
