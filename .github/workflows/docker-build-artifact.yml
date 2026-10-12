@@ -19,6 +19,11 @@ on:
         required: true
         type: boolean
         default: true
+      causal_conv1d:
+        description: "安装 causal-conv1d 预编译 wheel（同一个 Gated DeltaNet 里的 conv 快速内核；关掉会静默退回参考实现）"
+        required: true
+        type: boolean
+        default: true
       cleanup:
         description: "构建前清理 runner 磁盘（hosted runner 只有 ~14 GB 空闲，建议开启）"
         required: true
@@ -44,9 +49,13 @@ jobs:
       IMAGE_NAME: drex-decision-models
       IMAGE_TAG: ${{ inputs.image_tag }}
       DREX_REF: ${{ inputs.drex_ref }}
-      # 布尔 input 不能直接透给 shell：映射成套件的裸包名，空串表示不装。
-      # 基镜像 / Python / 依赖版本一律由 Dockerfile 决定，workflow 不重复传，避免两处漂移。
+      # 布尔 input 不能直接透给 shell，两个内核的映射方式不同：
+      #   fla  —— 映射成套件的裸包名，空串表示不装（Dockerfile 用同一个变量控制「装」和「验」）。
+      #   conv1d —— 只映射成 true/false。它那个预编译 wheel 的文件名很长而且带 torch 版本号，
+      #            一旦写在这里就变成第二个版本来源（Dockerfile 里已经有一份），必然漂移，
+      #            所以 workflow 只传开关，wheel 名与 sha256 全部由 Dockerfile 拥有。
       FLA_SPEC: "${{ inputs.flash_linear_attention && 'flash-linear-attention' || '' }}"
+      CONV1D: "${{ inputs.causal_conv1d }}"
       ARTIFACT: "drex-decision-models-${{ inputs.image_tag }}-amd64"
 
     steps:
@@ -80,6 +89,7 @@ jobs:
           build-args: |
             UPSTREAM_REF=${{ env.DREX_REF }}
             FLASH_LINEAR_ATTENTION_SPEC=${{ env.FLA_SPEC }}
+            INSTALL_CAUSAL_CONV1D=${{ env.CONV1D }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -92,6 +102,12 @@ jobs:
           docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" \
             python -c "import torch, transformers; print('torch', torch.__version__, '| transformers', transformers.__version__)" \
             || echo "torch/transformers import failed (not blocking)"
+          # 这条会真的把 causal_conv1d_cuda.so 载进来，是那个 wheel 的 ABI 在运行期的第二道实证
+          if [ "${CONV1D}" = "true" ]; then
+            docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" \
+              python -c "import torch, causal_conv1d; from causal_conv1d import causal_conv1d_fn, causal_conv1d_update; print('causal_conv1d', causal_conv1d.__version__)" \
+              || echo "causal_conv1d import failed (not blocking)"
+          fi
 
       # 镜像动辄 6-8 GB，单 artifact 上限 10 GB 是 GitHub 的硬限制、不可调，
       # 所以必须先压缩再传。docker save 失败要能被捕获，不然会留下半截文件。
@@ -124,6 +140,8 @@ jobs:
             echo "transformers:     $(probe 'import transformers; print(transformers.__version__)')"
             echo "fla_core:         $(probe 'import importlib.metadata as m; print(m.version("fla-core"))')"
             echo "fla_build_arg:    ${FLA_SPEC:-<empty, not installed>}"
+            echo "causal_conv1d:    $(probe 'import importlib.metadata as m; print(m.version("causal_conv1d"))')"
+            echo "conv1d_build_arg: ${CONV1D}"
             echo "run:              ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           } > "${ARTIFACT}.manifest.txt"
           cat "${ARTIFACT}.manifest.txt"
