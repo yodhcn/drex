@@ -167,6 +167,9 @@ RUN set -eux; \
 #
 # 下载 / 校验 / 安装 / 删包在同一个 RUN 里：187 MB 的 .whl 不会留在任何镜像层里。
 # URL 里的 "+" 编码成 %2B：路径里裸 "+" 合规，但中间代理有把它当空格处理的。
+# 落盘必须用**原始 wheel 名**（含 "+"），不能图省事叫 causal_conv1d.whl：
+# pip 会解析文件名的 dist-version-pytag-abitag-plattag 五段，改名后直接
+# `ERROR: ... is not a valid wheel filename.`（实测踩过）。
 # --no-deps：它的 install_requires 是 torch / packaging / ninja，前两个本来就已经装好，
 #            ninja 只服务于「从源码编译」那条路，而那条路我们不走。
 # 唯一性的保证来自 sha256：换了 wheel 却不换 sha 会直接构建失败，而不是装进一个来路不明的东西。
@@ -175,11 +178,12 @@ RUN set -eux; \
         python -c "import os, sys, platform, torch; w = os.environ['CAUSAL_CONV1D_WHEEL']; ver = w.split('-')[1].split('+')[0]; py = '%d%d' % sys.version_info[:2]; expect = 'causal_conv1d-%s+cu%storch%scxx11abi%s-cp%s-cp%s-linux_%s.whl' % (ver, torch.version.cuda.split('.')[0], '.'.join(torch.__version__.split('+')[0].split('.')[:2]), str(torch._C._GLIBCXX_USE_CXX11_ABI).upper(), py, py, 'aarch64' if platform.machine().lower() in ('aarch64', 'arm64') else 'x86_64'); assert expect == w, 'CAUSAL_CONV1D_WHEEL does not match this image; expected:\n  %s\ngot:\n  %s' % (expect, w); print('causal-conv1d wheel pin matches image:', w)"; \
         PKG_VERSION="$(printf '%s' "${CAUSAL_CONV1D_WHEEL}" | sed 's/^causal_conv1d-//; s/+.*$//')"; \
         URL_NAME="$(printf '%s' "${CAUSAL_CONV1D_WHEEL}" | sed 's/+/%2B/g')"; \
-        curl -fsSL --retry 3 --retry-delay 2 -o /tmp/causal_conv1d.whl \
+        WHL="/tmp/${CAUSAL_CONV1D_WHEEL}"; \
+        curl -fsSL --retry 3 --retry-delay 2 -o "${WHL}" \
             "https://github.com/Dao-AILab/causal-conv1d/releases/download/v${PKG_VERSION}/${URL_NAME}"; \
-        echo "${CAUSAL_CONV1D_SHA256}  /tmp/causal_conv1d.whl" | sha256sum -c -; \
-        python -m pip install --no-deps /tmp/causal_conv1d.whl; \
-        rm -f /tmp/causal_conv1d.whl; \
+        echo "${CAUSAL_CONV1D_SHA256}  ${WHL}" | sha256sum -c -; \
+        python -m pip install --no-deps "${WHL}"; \
+        rm -f "${WHL}"; \
     fi
 
 # 运行期工具链自检：Triton 的 _build() 需要「找得到 cc」+「Python.h」。

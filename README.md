@@ -414,6 +414,10 @@ sha256  a1fcd5d022b67ddfc9e1c291f890004c1c081a03d66b532f6eebe31219168e0e
 载进来并解析掉全部未定义符号（这是那道 ABI 的唯一实证），以及已装版本号等于上面那个固定的
 wheel 名（证明确实是它、没被别的东西顶替）。
 
+下载时**必须保留原始 wheel 名落盘**（含那个 `+`），不能图省事存成 `causal_conv1d.whl`：
+pip 会按 `dist-version-pytag-abitag-plattag` 解析本地文件名的五段，改名后直接
+`ERROR: ... is not a valid wheel filename.`（URL 里的 `+` 要编码成 `%2B`，但落盘的文件名要用原始的 `+`）。
+
 ### 为什么不用换基镜像
 
 不必。`nvidia/cuda:12.8.2-runtime-ubuntu24.04` 已经同时满足这个 wheel 的两个前提：
@@ -548,6 +552,8 @@ docker run --rm --gpus all -p 8000:8000 \
   而那个 `.so` 如果链接了 `libcuda.so.1` 就载不进来。这是本仓库唯一没法在本地预先验证的一点
   （生产镜像里有驱动，运行期 import 不受影响）。真遇到就从断言里去掉 `import causal_conv1d_cuda`、
   只保留版本号比对。
+- **`ERROR: ... is not a valid wheel filename.`** —— 下载时把 wheel 改名了。pip 要按
+  `dist-version-pytag-abitag-plattag` 解析文件名，落盘必须用原始名（含 `+`）。
 
 ### 其他无害的日志
 
