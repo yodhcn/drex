@@ -219,8 +219,17 @@ WORKDIR /opt/drex
 #    错了就在这里爆 `undefined symbol`，而不是在用户的第一次请求里。
 #    （先 import torch 再 import 它：torch 在 import 时把自己那套 nvidia-*-cu12 用户态库
 #      以 RTLD_GLOBAL 预加载进来，.so 的 libcudart 依赖要靠它才能解析到。）
-# ② 已装版本号必须等于固定的那个 wheel（含 +cu12torch2.8cxx11abiTRUE 这段 local version）——
-#    证明装进去的确实是 INSTALL/下载那一步指定的那个文件，而不是被别的什么顶替了。
+# ② 装进去的必须**就是**下载的那个文件，而不是被别的什么顶替了。这一条不能用版本号来验：
+#    上游发布出来的 wheel，其 METADATA 里写的是裸版本 `1.7.0`，那段
+#    `+cu12torch2.8cxx11abiTRUE` **只存在于 Release 资源名里**，不在 wheel 内部
+#    （已从资产里取出 `causal_conv1d-1.7.0.dist-info/METADATA` 核对过；上游 setup.py 的
+#      get_package_version() 只在 CAUSAL_CONV1D_LOCAL_VERSION 被设置时才把它拼进版本，
+#     而发布时没设 → dist-info 目录名是 `causal_conv1d-1.7.0.dist-info`）。
+#    所以 `importlib.metadata.version()` 只会给 `1.7.0`，拿它比 local version 必然误报。
+#    改成比 pip 自己写下的来源凭据：`direct_url.json`（装本地文件时 pip 会写下
+#    `{"url": "file:///tmp/<原始文件名，+ 编码为 %2B>"}`），把它的 basename 还原后
+#    与 CAUSAL_CONV1D_WHEEL 逐字比对 —— 这比版本号更硬：它证明的是「装的就是那个文件」，
+#    而那个文件的内容已经被上一层的 sha256sum 钉死了。
 #    符号名同理：causal_conv1d_fn / causal_conv1d_update 就是 transformers 从
 #    `causal_conv1d` 这个包里取的两个名字（它不在 _KERNELS_INTERNAL_PATH_MAPPINGS 里，
 #    走的是 `{package}.{func_name}` 默认路径），所以断言里直接 import 这两个名字。
@@ -235,7 +244,7 @@ RUN set -eux; \
         python -c "from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule; assert chunk_gated_delta_rule.__module__.startswith('fla.'), chunk_gated_delta_rule.__module__; assert fused_recurrent_gated_delta_rule.__module__.startswith('fla.'), fused_recurrent_gated_delta_rule.__module__; print('fla kernel path OK:', chunk_gated_delta_rule.__module__)"; \
     fi; \
     if [ "${INSTALL_CAUSAL_CONV1D}" = "true" ]; then \
-        python -c "import os, torch, importlib.metadata as M, causal_conv1d_cuda; from causal_conv1d import causal_conv1d_fn, causal_conv1d_update; want = os.environ['CAUSAL_CONV1D_WHEEL'].rsplit('.whl', 1)[0].split('-')[1]; got = M.version('causal_conv1d'); assert got.split('+')[0] == want.split('+')[0] and got.split('+')[-1].lower() == want.split('+')[-1].lower(), (got, want); print('causal_conv1d OK |', got, '|', causal_conv1d_cuda.__file__)"; \
+        python -c "import os, json, urllib.parse, importlib.metadata as M, torch, causal_conv1d_cuda; from causal_conv1d import causal_conv1d_fn, causal_conv1d_update; w = os.environ['CAUSAL_CONV1D_WHEEL']; d = M.distribution('causal_conv1d'); got = d.version; want = w.rsplit('.whl', 1)[0].split('-')[1].split('+')[0]; assert got.split('+')[0] == want, (got, want); du = d.read_text('direct_url.json') or ''; assert du, 'no direct_url.json next to causal_conv1d-*.dist-info (pip did not record the install source)'; src = os.path.basename(urllib.parse.unquote(urllib.parse.urlparse(json.loads(du)['url']).path)); assert src == w, 'installed from a different wheel than pinned; expected:\n  %s\ngot:\n  %s' % (w, src); print('causal_conv1d OK |', got, '| installed from', src, '|', causal_conv1d_cuda.__file__)"; \
     fi; \
     python serve.py --help > /dev/null; \
     python inference.py --help > /dev/null

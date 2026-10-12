@@ -221,6 +221,8 @@ python serve.py --model /models/whatever --name drex-v1.5 --host 0.0.0.0
 
 - artifact 名 `drex-decision-models-<tag>-amd64`，内含 `.tar.gz` + `.sha256` + `.manifest.txt`
 - `.manifest.txt` 里记了镜像 ID、大小、tar 的 sha256、镜像内实际的 Python / torch / torch 的 CUDA / transformers / fla-core / causal_conv1d 版本、上游仓库与 commit、以及产生它的那次 run 链接，方便日后追溯
+  （其中 `causal_conv1d` 记为 **`1.7.0`** 是正常的：那段 `+cu12torch2.8cxx11abiTRUE` 只在上游的 Release
+  资源名里，不在 wheel 内部 —— 见 [同一段代码里的 `causal_conv1d_fn`](#同一段代码里的-causal_conv1d_fn--causal_conv1d_update)）
 - 上传时用 `compression-level: 0`（tar.gz 已经压过一遍，再压纯属浪费 CPU 和上传时间）
 - 保留 30 天，同一 tag 重跑会直接覆盖旧 artifact
 
@@ -410,9 +412,20 @@ sha256  a1fcd5d022b67ddfc9e1c291f890004c1c081a03d66b532f6eebe31219168e0e
 旧 ABI 的 `_ZNSs` 出现 0 处。所以是 `cxx11abiTRUE`。
 **选错这一位的后果就是 `import` 时报 `undefined symbol`**，所以它值得单独查一次而不是默认。
 
-装完之后构建期还会验两件事（`Dockerfile` 最后一层）：`import causal_conv1d_cuda` 能把这个 `.so`
-载进来并解析掉全部未定义符号（这是那道 ABI 的唯一实证），以及已装版本号等于上面那个固定的
-wheel 名（证明确实是它、没被别的东西顶替）。
+装完之后构建期还会验两件事（`Dockerfile` 最后一层）：
+
+1. `import causal_conv1d_cuda` 能把这个 `.so` 载进来并解析掉全部未定义符号 —— 这是那道 ABI 的唯一实证；
+2. 装进去的**就是**下载的那个文件，而不是被别的什么顶替了。
+
+第 2 条**不能用版本号来验**，这里踩过一次：上游发布出来的 wheel，内部 `METADATA` 写的是裸版本
+`Version: 1.7.0`，`causal_conv1d-1.7.0.dist-info/` 也是这个名，那段 `+cu12torch2.8cxx11abiTRUE`
+**只存在于 Release 的资源名里，不在 wheel 内部**（上游 `setup.py` 的 `get_package_version()` 只在
+`CAUSAL_CONV1D_LOCAL_VERSION` 被设置时才把它拼进版本，而发布时没设 —— 这个 `+…` 段的作用更像
+build tag）。所以 `importlib.metadata.version("causal_conv1d")` 只会给 `1.7.0`（`pip show` 同理），
+拿它去比 local version 必然误报。改比 pip 自己写下的来源凭据：装本地文件时 pip 会在 dist-info 里
+留下 `direct_url.json`，其中的 `url` 记录了**原始 wheel 文件路径**（`+` 编码成 `%2B`）——
+把它的 basename 还原后与 `CAUSAL_CONV1D_WHEEL` 逐字比对。这比版本号更硬：它证明的是
+「装的就是那个文件」，而那个文件的内容已经被上一层的 `sha256sum` 钉死了。
 
 下载时**必须保留原始 wheel 名落盘**（含那个 `+`），不能图省事存成 `causal_conv1d.whl`：
 pip 会按 `dist-version-pytag-abitag-plattag` 解析本地文件名的五段，改名后直接
@@ -542,18 +555,27 @@ docker run --rm --gpus all -p 8000:8000 \
 
 ### 构建期的 `causal_conv1d` 断言失败
 
-镜像最后一层有两条断言。分清这三种失败：
+镜像最后一层有两条断言。分清这几种失败：
 
 - **`AssertionError: CAUSAL_CONV1D_WHEEL does not match this image`** —— 环境漂移了（torch 换了
   小版本、基镜像换了 Python、或换了架构），所以固定的 wheel 名不再适用。报错里已经把「按当前环境
   该用的名字」原样打出来了，改 `Dockerfile` 里那两行 `CAUSAL_CONV1D_WHEEL` / `CAUSAL_CONV1D_SHA256` 即可。
+- **`AssertionError: installed from a different wheel than pinned`** —— 装进去的 dist 不是从
+  `CAUSAL_CONV1D_WHEEL` 那个文件来的（下载路径被改、或被人从索引又装了一次）。报错把「预期文件名」
+  与 `direct_url.json` 里记录的实际文件名都打出来了。
+- **`AssertionError: no direct_url.json next to causal_conv1d-*.dist-info`** —— 安装时的 pip 没有写下
+  来源凭据（正常不会；只有换掉 pip 实现才可能）。
 - **`ImportError: ... undefined symbol ...`** —— wheel 装进去了但 ABI 不匹配，说明 `cxx11abi` 那一位选错了。
 - **`ImportError: libcuda.so.1: cannot open shared object file`** —— 构建机是 runner（没有 GPU、没有驱动），
   而那个 `.so` 如果链接了 `libcuda.so.1` 就载不进来。这是本仓库唯一没法在本地预先验证的一点
   （生产镜像里有驱动，运行期 import 不受影响）。真遇到就从断言里去掉 `import causal_conv1d_cuda`、
-  只保留版本号比对。
+  只保留来源比对。
 - **`ERROR: ... is not a valid wheel filename.`** —— 下载时把 wheel 改名了。pip 要按
   `dist-version-pytag-abitag-plattag` 解析文件名，落盘必须用原始名（含 `+`）。
+
+> **别拿版本号去比 local version**：镜像里 `python -c "import importlib.metadata as m; print(m.version('causal_conv1d'))"`
+> 只会输出 `1.7.0`，`+cu12torch2.8cxx11abiTRUE` 那段不在 wheel 内部（见上一节）。要确认「装的是哪一个」，
+> 看 `direct_url.json`。
 
 ### 其他无害的日志
 
