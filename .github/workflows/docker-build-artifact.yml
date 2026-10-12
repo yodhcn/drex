@@ -1,0 +1,144 @@
+name: docker_image_build_artifact
+
+# 只手动触发：Actions -> docker_image_build_artifact -> Run workflow。
+# 没有 push / PR 触发，所以合并代码不会自动构建。
+# 构建环境是 ubuntu runner（这里的 Ubuntu 指 runner，不是镜像本身 —— 镜像是 CUDA 基镜像）。
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "镜像 tag，决定 tar 里的镜像名 drex-decision-models:<tag>"
+        required: true
+        default: latest
+      drex_ref:
+        description: "上游 nace-ai/drex-decision-models 的 ref：分支 / tag / commit SHA（要可复现的镜像就固定成 tag 或 SHA）"
+        required: true
+        default: main
+      flash_linear_attention:
+        description: "安装 flash-linear-attention（Gated DeltaNet 快速内核；关掉会静默退回慢速参考实现）"
+        required: true
+        type: boolean
+        default: true
+      cleanup:
+        description: "构建前清理 runner 磁盘（hosted runner 只有 ~14 GB 空闲，建议开启）"
+        required: true
+        type: boolean
+        default: true
+
+# artifact 形态不需要 packages: write，也不需要任何 login 步骤
+permissions:
+  contents: read
+
+# 两个 8 GB 级别的构建同时跑会互相挤掉 GHA 缓存（每仓库上限 10 GB），所以排队而不是并发
+concurrency:
+  group: docker-build-${{ github.repository }}-${{ inputs.image_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      IMAGE_NAME: drex-decision-models
+      IMAGE_TAG: ${{ inputs.image_tag }}
+      DREX_REF: ${{ inputs.drex_ref }}
+      # 布尔 input 不能直接透给 shell：映射成套件的裸包名，空串表示不装。
+      # 基镜像 / Python / 依赖版本一律由 Dockerfile 决定，workflow 不重复传，避免两处漂移。
+      FLA_SPEC: "${{ inputs.flash_linear_attention && 'flash-linear-attention' || '' }}"
+      ARTIFACT: "drex-decision-models-${{ inputs.image_tag }}-amd64"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        if: ${{ inputs.cleanup }}
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: false
+          docker-images: false
+          swap-storage: false
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # push: false + load: true —— 不进 daemon 的话，后面的 docker save 什么都导不出来
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          build-args: |
+            UPSTREAM_REF=${{ env.DREX_REF }}
+            FLASH_LINEAR_ATTENTION_SPEC=${{ env.FLA_SPEC }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # runner 上没有 GPU，所以这里只验证 import 链，不加载权重。
+      # 失败不阻断：不能让辛苦构建出来的镜像连 artifact 都传不上去。
+      - name: Smoke test
+        run: |
+          set -uo pipefail
+          docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" python -V || echo "python -V failed"
+          docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" \
+            python -c "import torch, transformers; print('torch', torch.__version__, '| transformers', transformers.__version__)" \
+            || echo "torch/transformers import failed (not blocking)"
+
+      # 镜像动辄 6-8 GB，单 artifact 上限 10 GB 是 GitHub 的硬限制、不可调，
+      # 所以必须先压缩再传。docker save 失败要能被捕获，不然会留下半截文件。
+      - name: Save image
+        run: |
+          set -euo pipefail
+          if command -v pigz >/dev/null 2>&1; then COMP=pigz; else COMP=gzip; fi
+          docker save "${IMAGE_NAME}:${IMAGE_TAG}" | "$COMP" > "${RUNNER_TEMP}/${ARTIFACT}.tar.gz"
+          cd "${RUNNER_TEMP}"
+          # sha256 里只写文件名，下载到同一目录后可以直接 sha256sum -c
+          sha256sum "${ARTIFACT}.tar.gz" > "${ARTIFACT}.tar.gz.sha256"
+          ls -la "${ARTIFACT}.tar.gz" "${ARTIFACT}.tar.gz.sha256"
+
+      - name: Manifest
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          probe() { docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" python -c "$1" 2>/dev/null || echo unknown; }
+          {
+            echo "# drex-decision-models image manifest"
+            echo "image:            ${IMAGE_NAME}:${IMAGE_TAG}"
+            echo "platform:         linux/amd64"
+            echo "image_id:         $(docker image inspect --format '{{.Id}}' "${IMAGE_NAME}:${IMAGE_TAG}")"
+            echo "image_size_bytes: $(docker image inspect --format '{{.Size}}' "${IMAGE_NAME}:${IMAGE_TAG}")"
+            echo "tar_sha256:       $(cut -d' ' -f1 "${ARTIFACT}.tar.gz.sha256")"
+            echo "upstream:         $(docker run --rm "${IMAGE_NAME}:${IMAGE_TAG}" cat /opt/upstream.txt | tr '\n' ' ')"
+            echo "python:           $(probe 'import platform; print(platform.python_version())')"
+            echo "torch:            $(probe 'import torch; print(torch.__version__)')"
+            echo "torch_cuda:       $(probe 'import torch; print(torch.version.cuda)')"
+            echo "transformers:     $(probe 'import transformers; print(transformers.__version__)')"
+            echo "fla_core:         $(probe 'import importlib.metadata as m; print(m.version("fla-core"))')"
+            echo "fla_build_arg:    ${FLA_SPEC:-<empty, not installed>}"
+            echo "run:              ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          } > "${ARTIFACT}.manifest.txt"
+          cat "${ARTIFACT}.manifest.txt"
+
+      # compression-level: 0 —— tar.gz 已经压过一遍，再压纯属浪费 CPU 和上传时间。
+      # overwrite: true —— 同一个 tag 重跑时 v4 默认会因 artifact 重名直接失败。
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: |
+            ${{ runner.temp }}/${{ env.ARTIFACT }}.tar.gz
+            ${{ runner.temp }}/${{ env.ARTIFACT }}.tar.gz.sha256
+            ${{ runner.temp }}/${{ env.ARTIFACT }}.manifest.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+          overwrite: true
